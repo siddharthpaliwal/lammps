@@ -47,6 +47,8 @@ class FixSRD : public Fix {
   int rescale_rotate,rescale_collide;
   double gridsrd,gridsearch,lamda,radfactor,cubictol;
   int triclinic,change_size,change_shape,deformflag;
+  int slipstyle;
+  double B[6];//coefficients of surface slip modes
 
   double dt_big,dt_srd;
   double mass_big,mass_srd;
@@ -223,6 +225,8 @@ class FixSRD : public Fix {
             double *, double *,  double *);
   void slip_wall(double *, int, double *, double *);
   void noslip(double *, double *, double *, Big *, int,
+              double *, double *,  double *);
+  void active_slip(double *, double *, double *, Big *,
               double *, double *,  double *);
 
   void force_torque(double *, double *, double *,

@@ -51,6 +51,7 @@ enum{INSIDE_ERROR,INSIDE_WARN,INSIDE_IGNORE};
 enum{BIG_MOVE,SRD_MOVE,SRD_ROTATE};
 enum{CUBIC_ERROR,CUBIC_WARN};
 enum{SHIFT_NO,SHIFT_YES,SHIFT_POSSIBLE};
+enum{PASSIVESLIP,ACTIVESLIP};
 
 enum{NO_REMAP,X_REMAP,V_REMAP};                   // same as fix_deform.cpp
 
@@ -73,18 +74,18 @@ static const char cite_fix_srd[] =
   " pages =   {174106}\n"
   "}\n\n";
 
-//#define SRD_DEBUG 1
-//#define SRD_DEBUG_ATOMID 58
-//#define SRD_DEBUG_TIMESTEP 449
+#define SRD_DEBUG 1
+#define SRD_DEBUG_ATOMID 58
+#define SRD_DEBUG_TIMESTEP 449
 
 /* ---------------------------------------------------------------------- */
 
 FixSRD::FixSRD(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, arg),
-  wallfix(NULL), wallwhich(NULL), xwall(NULL), xwallhold(NULL),
-  vwall(NULL), fwall(NULL), avec_ellipsoid(NULL), avec_line(NULL),
-  avec_tri(NULL), random(NULL), randomshift(NULL), flocal(NULL),
-  tlocal(NULL), biglist(NULL), binhead(NULL), binnext(NULL), sbuf1(NULL),
-  sbuf2(NULL), rbuf1(NULL), rbuf2(NULL), nbinbig(NULL), binbig(NULL),
+  wallfix(NULL), wallwhich(NULL), xwall(NULL), xwallhold(NULL), 
+  vwall(NULL), fwall(NULL), avec_ellipsoid(NULL), avec_line(NULL), 
+  avec_tri(NULL), random(NULL), randomshift(NULL), flocal(NULL), 
+  tlocal(NULL), biglist(NULL), binhead(NULL), binnext(NULL), sbuf1(NULL), 
+  sbuf2(NULL), rbuf1(NULL), rbuf2(NULL), nbinbig(NULL), binbig(NULL), 
   binsrd(NULL), stencil(NULL)
 {
   if (lmp->citeme) lmp->citeme->add(cite_fix_srd);
@@ -123,6 +124,8 @@ FixSRD::FixSRD(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, arg),
   shiftseed = 0;
   tstat = 0;
   rescale_rotate = rescale_collide = 1;
+  slipstyle = PASSIVESLIP;
+  B[0] = B[1] = B[2] = B[3] = B[4] = B[5] = 0.0;
 
   int iarg = 8;
   while (iarg < narg) {
@@ -204,6 +207,20 @@ FixSRD::FixSRD(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, arg),
       }
       else error->all(FLERR,"Illegal fix srd command");
       iarg += 2;
+    } else if (strcmp(arg[iarg],"activeslip") == 0) {
+      if (iarg+2 > narg) error->all(FLERR,"Illegal fix srd command for activeslip");
+      if (strcmp(arg[iarg+1],"no") == 0) {
+        slipstyle = PASSIVESLIP;
+        iarg += 2;
+      } else if (strcmp(arg[iarg+1],"yes") == 0) {
+        if (iarg+5 > narg) error->all(FLERR,"Illegal fix srd command for activeslip");
+        slipstyle = ACTIVESLIP;
+        //Read Active slip mode coefficients B0, B1 and B2
+        B[0] = force->numeric(FLERR,arg[iarg+2]);
+        B[1] = force->numeric(FLERR,arg[iarg+3]);
+        B[2] = force->numeric(FLERR,arg[iarg+4]);
+        iarg += 5;
+      } else error->all(FLERR,"Illegal fix srd command for activeslip, specify yes or no");
     } else error->all(FLERR,"Illegal fix srd command");
   }
 
@@ -223,6 +240,8 @@ FixSRD::FixSRD(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, arg),
     error->all(FLERR,"Illegal fix srd command");
   if ((shiftuser == SHIFT_YES || shiftuser == SHIFT_POSSIBLE) &&
       shiftseed <= 0) error->all(FLERR,"Illegal fix srd command");
+  if(collidestyle == NOSLIP && slipstyle == ACTIVESLIP )
+    error->all(FLERR,"Illegal fix srd command");
 
   // initialize Marsaglia RNG with processor-unique seed
 
@@ -1037,8 +1056,8 @@ void FixSRD::reset_velocities()
   for (i = 0; i < nbins; i++){
     if (vbin[i].owner) {
       if (vbin[i].n > 1) {
-        srd_bin_temp += vbin[i].value[0]/(vbin[i].n-dof_temp);
-        srd_bin_count++;
+	srd_bin_temp += vbin[i].value[0]/(vbin[i].n-dof_temp);
+	srd_bin_count++;
       }
     }
   }
@@ -1348,22 +1367,25 @@ void FixSRD::collisions_single()
                         "inside big particle " TAGINT_FORMAT
                         " on step " BIGINT_FORMAT " bounce %d",
                         atom->tag[i],atom->tag[j],update->ntimestep,ibounce+1);
-                if (insideflag == INSIDE_ERROR) error->one(FLERR,str);
-                error->warning(FLERR,str);
-              } else{
+		if (insideflag == INSIDE_ERROR) error->one(FLERR,str);
+		error->warning(FLERR,str);
+	      } else{
                 sprintf(str,
                         "SRD particle " TAGINT_FORMAT " started "
                         "inside wall %d on step " BIGINT_FORMAT " bounce %d",
                         atom->tag[i],j,update->ntimestep,ibounce+1);
-                if (insideflag == INSIDE_ERROR) error->one(FLERR,str);
-                error->warning(FLERR,str);
-              }
+		if (insideflag == INSIDE_ERROR) error->one(FLERR,str);
+		error->warning(FLERR,str);
+	      }
             }
             break;
           }
 
           if (collidestyle == SLIP) {
-            if (type != WALL) slip(v[i],v[j],x[j],big,xscoll,norm,vsnew);
+            if (type != WALL) {
+                if(slipstyle == ACTIVESLIP) active_slip(v[i],v[j],x[j],big,xscoll,norm,vsnew);
+                else slip(v[i],v[j],x[j],big,xscoll,norm,vsnew);
+            }
             else slip_wall(v[i],j,norm,vsnew);
           } else {
             if (type != WALL) noslip(v[i],v[j],x[j],big,-1, xscoll,norm,vsnew);
@@ -1507,16 +1529,16 @@ void FixSRD::collisions_multi()
                         "inside big particle " TAGINT_FORMAT
                         " on step " BIGINT_FORMAT " bounce %d",
                         atom->tag[i],atom->tag[j],update->ntimestep,ibounce+1);
-                if (insideflag == INSIDE_ERROR) error->one(FLERR,str);
-                error->warning(FLERR,str);
-              } else{
+		if (insideflag == INSIDE_ERROR) error->one(FLERR,str);
+		error->warning(FLERR,str);
+	      } else{
                 sprintf(str,
                         "SRD particle " TAGINT_FORMAT " started "
                         "inside wall %d on step " BIGINT_FORMAT " bounce %d",
                         atom->tag[i],j,update->ntimestep,ibounce+1);
-                if (insideflag == INSIDE_ERROR) error->one(FLERR,str);
-                error->warning(FLERR,str);
-              }
+		if (insideflag == INSIDE_ERROR) error->one(FLERR,str);
+		error->warning(FLERR,str);
+	      }
             }
             t_first = 0.0;
             break;
@@ -2322,6 +2344,83 @@ void FixSRD::slip(double *vs, double *vb, double *xb, Big *big,
   vsnew[0] = (vnmag+vsurf_dot_n)*norm[0] + tangent[0];
   vsnew[1] = (vnmag+vsurf_dot_n)*norm[1] + tangent[1];
   vsnew[2] = (vnmag+vsurf_dot_n)*norm[2] + tangent[2];
+}
+
+/* ----------------------------------------------------------------------
+   SLIP collision via specified surface 'active slip' velocity
+   with BIG particle with omega
+   vs = velocity of SRD, vb = velocity of BIG
+   xb = position of BIG, omega = rotation of BIG
+   xsurf = collision pt on surf of BIG
+   norm = unit normal from surface of BIG at collision pt
+   v of BIG particle in direction of surf normal is added to v of SRD
+   includes component due to rotation of BIG
+   add the angle and orientation dependent surface slip velocity to v of SRD
+   following  eq. (5) 10.1103/PhysRevE.82.041921
+   return vsnew of SRD
+------------------------------------------------------------------------- */
+
+void FixSRD::active_slip(double *vs, double *vb, double *xb, Big *big,
+                         double *xsurf, double *norm, double *vsnew)
+{
+  double r1,r2,vnmag,vs_dot_n,vsurf_dot_n,e_dot_n, vamag;
+  double tangent[3],vsurf[3], vact[3];
+  double *omega = big->omega;
+  double *ex = big->ex; //Assumed ex is the swimming direction
+  double *ey = big->ey;
+  double *ez = big->ez;
+
+  //active slip velocity in body frame at the collision pt assuming ex as swimming dir.
+
+  e_dot_n = ex[0]*norm[0] + ex[1]*norm[1] + ex[2]*norm[2];
+  vamag = (B[1]+B[2]*e_dot_n);
+  vact[0] = vamag*(e_dot_n*norm[0] - ex[0]);
+  vact[1] = vamag*(e_dot_n*norm[1] - ex[1]);
+  vact[2] = vamag*(e_dot_n*norm[2] - ex[2]);
+
+    /*
+  while (1) {
+    r1 = sigma * random->gaussian();
+    r2 = sigma * random->gaussian();
+    vnmag = sqrt(r1*r1 + r2*r2);
+    if (vnmag*vnmag <= vmaxsq) break;
+  }
+
+  vs_dot_n = vs[0]*norm[0] + vs[1]*norm[1] + vs[2]*norm[2];
+
+  //update the new tangential vel. (eq. (5) 10.1103/PhysRevE.82.041921 )
+  tangent[0] = vact[0];
+  tangent[1] = vact[1];
+  tangent[2] = vact[2];
+
+  // vsurf = velocity of collision pt from translation/rotation of BIG particle
+  // NOTE: for sphere could just use vsurf = vb, since w x (xsurf-xb)
+  //       is orthogonal to norm and thus doesn't contribute to vsurf_dot_n
+
+  vsurf[0] = vb[0] + omega[1]*(xsurf[2]-xb[2]) - omega[2]*(xsurf[1]-xb[1]);
+  vsurf[1] = vb[1] + omega[2]*(xsurf[0]-xb[0]) - omega[0]*(xsurf[2]-xb[2]);
+  vsurf[2] = vb[2] + omega[0]*(xsurf[1]-xb[1]) - omega[1]*(xsurf[0]-xb[0]);
+
+  // velocity normal to body sampled from gaussian
+  vsurf_dot_n = vsurf[0]*norm[0] + vsurf[1]*norm[1] + vsurf[2]*norm[2];
+
+  vsnew[0] = (vnmag+vsurf_dot_n)*norm[0] + tangent[0];
+  vsnew[1] = (vnmag+vsurf_dot_n)*norm[1] + tangent[1];
+  vsnew[2] = (vnmag+vsurf_dot_n)*norm[2] + tangent[2];
+    */
+
+  //Surface velocity in space frame
+
+  vsurf[0] = vb[0] + omega[1]*(xsurf[2]-xb[2]) - omega[2]*(xsurf[1]-xb[1]) + vact[0];
+  vsurf[1] = vb[1] + omega[2]*(xsurf[0]-xb[0]) - omega[0]*(xsurf[2]-xb[2]) + vact[1];
+  vsurf[2] = vb[2] + omega[0]*(xsurf[1]-xb[1]) - omega[1]*(xsurf[0]-xb[0]) + vact[2];
+
+  //Update the velocties of srd with bounce back rule
+
+  vsnew[0] = -vs[0] + 2.0*vsurf[0];
+  vsnew[1] = -vs[1] + 2.0*vsurf[1];
+  vsnew[2] = -vs[2] + 2.0*vsurf[2];
+
 }
 
 /* ----------------------------------------------------------------------
